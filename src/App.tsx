@@ -8,6 +8,8 @@ import {
   FileSpreadsheet,
   Filter,
   Gauge,
+  Globe,
+  Layers,
   MousePointerClick,
   Sparkles,
   TrendingDown,
@@ -23,14 +25,13 @@ import { Button } from './components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './components/ui/card'
 import { Input } from './components/ui/input'
 
-type GroupMode = 'supply' | 'bundle'
+type ReportType = 'bundle' | 'country'
 type ReasonType = 'Zero sRPM' | 'Low sRPM' | 'High requests / low cost share' | 'Very low fill rate'
 
 type TrafficRow = {
   rowId: number
   supplyName: string
-  bundle: string
-  country: string
+  dimension: string
   requests: number
   impressions: number
   cost: number
@@ -96,6 +97,24 @@ const REASON_LABELS: Record<ReasonType, string> = {
   'Very low fill rate': 'Low fill',
 }
 
+const REPORT_CONFIG: Record<
+  ReportType,
+  { label: string; dimensionLabel: string; dimensionMatcher: RegExp; icon: LucideIcon }
+> = {
+  bundle: {
+    label: 'Bundle',
+    dimensionLabel: 'Platform ID',
+    dimensionMatcher: /platformid|platform|bundle/,
+    icon: Layers,
+  },
+  country: {
+    label: 'Country',
+    dimensionLabel: 'Country',
+    dimensionMatcher: /country|geo/,
+    icon: Globe,
+  },
+}
+
 const formatNumber = (value: number) => new Intl.NumberFormat('en-US').format(Math.round(value))
 const formatCost = (value: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value)
 const formatPercent = (value: number) => `${(value * 100).toFixed(2)}%`
@@ -127,14 +146,14 @@ function findHeaderIndex(headers: string[], matcher: RegExp): number {
   return headers.findIndex((value) => matcher.test(value))
 }
 
-function pickHeaderRow(rows: unknown[][]): number {
+function pickHeaderRow(rows: unknown[][], dimensionMatcher: RegExp): number {
   let winner = 0
   let bestScore = -1
   for (let i = 0; i < Math.min(10, rows.length); i += 1) {
     const header = rows[i].map(normalizeHeader)
     const score =
       Number(header.some((h) => /supplyname/.test(h))) +
-      Number(header.some((h) => /(platformid|bundle|platform)/.test(h))) +
+      Number(header.some((h) => dimensionMatcher.test(h))) +
       Number(header.some((h) => /demandrequests|requests/.test(h))) +
       Number(header.some((h) => /supplyimpressions|impressions/.test(h))) +
       Number(header.some((h) => /cost/.test(h))) +
@@ -147,7 +166,8 @@ function pickHeaderRow(rows: unknown[][]): number {
   return winner
 }
 
-function extractRowsFromSheet(sheet: XLSX.WorkSheet): { rows: TrafficRow[]; error?: string } {
+function extractRowsFromSheet(sheet: XLSX.WorkSheet, reportType: ReportType): { rows: TrafficRow[]; error?: string } {
+  const config = REPORT_CONFIG[reportType]
   const data = XLSX.utils.sheet_to_json(sheet, {
     header: 1,
     raw: true,
@@ -158,19 +178,21 @@ function extractRowsFromSheet(sheet: XLSX.WorkSheet): { rows: TrafficRow[]; erro
     return { rows: [] }
   }
 
-  const headerRowIndex = pickHeaderRow(data)
+  const headerRowIndex = pickHeaderRow(data, config.dimensionMatcher)
   const headerRow = (data[headerRowIndex] ?? []).map(normalizeHeader)
 
   const supplyIndex = findHeaderIndex(headerRow, /supplyname|supply/)
-  const bundleIndex = findHeaderIndex(headerRow, /platformid|bundle|platform/)
-  const countryIndex = findHeaderIndex(headerRow, /country|geo/)
+  const dimensionIndex = findHeaderIndex(headerRow, config.dimensionMatcher)
   const requestsIndex = findHeaderIndex(headerRow, /demandrequests|requests/)
   const impressionsIndex = findHeaderIndex(headerRow, /supplyimpressions|impressions/)
   const costIndex = findHeaderIndex(headerRow, /^cost$|totalcost|spend/)
   const srpmIndex = findHeaderIndex(headerRow, /srpm/)
 
-  if ([supplyIndex, bundleIndex, requestsIndex, impressionsIndex, costIndex].some((idx) => idx < 0)) {
-    return { rows: [], error: 'Could not find required columns in this sheet.' }
+  if ([supplyIndex, dimensionIndex, requestsIndex, impressionsIndex, costIndex].some((idx) => idx < 0)) {
+    return {
+      rows: [],
+      error: `Could not find required columns. Expected: Supply Name, ${config.dimensionLabel}, Supply Requests, Supply Impressions, Cost, sRPM $.`,
+    }
   }
 
   const rows: TrafficRow[] = []
@@ -181,8 +203,8 @@ function extractRowsFromSheet(sheet: XLSX.WorkSheet): { rows: TrafficRow[]; erro
       continue
     }
     const supplyName = String(row[supplyIndex] ?? '').trim()
-    const bundle = String(row[bundleIndex] ?? '').trim()
-    if (!supplyName || !bundle) {
+    const dimension = String(row[dimensionIndex] ?? '').trim()
+    if (!supplyName || !dimension) {
       continue
     }
 
@@ -197,8 +219,7 @@ function extractRowsFromSheet(sheet: XLSX.WorkSheet): { rows: TrafficRow[]; erro
     rows.push({
       rowId,
       supplyName,
-      bundle,
-      country: String(row[countryIndex] ?? 'N/A').trim() || 'N/A',
+      dimension,
       requests,
       impressions,
       cost,
@@ -210,10 +231,10 @@ function extractRowsFromSheet(sheet: XLSX.WorkSheet): { rows: TrafficRow[]; erro
   return { rows }
 }
 
-function buildAnalysis(rows: TrafficRow[], groupMode: GroupMode, thresholds: Thresholds) {
+function buildAnalysis(rows: TrafficRow[], thresholds: Thresholds) {
   const totalsByGroup = new Map<string, Metrics>()
   for (const row of rows) {
-    const groupKey = groupMode === 'supply' ? row.supplyName : row.bundle
+    const groupKey = row.supplyName
     const existing = totalsByGroup.get(groupKey) ?? { requests: 0, impressions: 0, cost: 0 }
     existing.requests += row.requests
     existing.impressions += row.impressions
@@ -223,7 +244,7 @@ function buildAnalysis(rows: TrafficRow[], groupMode: GroupMode, thresholds: Thr
 
   const groupMap = new Map<string, GroupAnalysis>()
   for (const row of rows) {
-    const groupKey = groupMode === 'supply' ? row.supplyName : row.bundle
+    const groupKey = row.supplyName
     const totals = totalsByGroup.get(groupKey)
     if (!totals) {
       continue
@@ -307,10 +328,10 @@ function uniqueCandidates(values: number[], fallback: number[]): number[] {
   return Array.from(new Set(normalized)).sort((a, b) => a - b)
 }
 
-function buildOptimizationCandidates(rows: TrafficRow[], groupMode: GroupMode): Thresholds[] {
+function buildOptimizationCandidates(rows: TrafficRow[]): Thresholds[] {
   const totalsByGroup = new Map<string, Metrics>()
   for (const row of rows) {
-    const groupKey = groupMode === 'supply' ? row.supplyName : row.bundle
+    const groupKey = row.supplyName
     const existing = totalsByGroup.get(groupKey) ?? { requests: 0, impressions: 0, cost: 0 }
     existing.requests += row.requests
     existing.impressions += row.impressions
@@ -327,7 +348,7 @@ function buildOptimizationCandidates(rows: TrafficRow[], groupMode: GroupMode): 
   const costShares: number[] = []
 
   for (const row of rows) {
-    const groupKey = groupMode === 'supply' ? row.supplyName : row.bundle
+    const groupKey = row.supplyName
     const totals = totalsByGroup.get(groupKey)
     if (!totals) {
       continue
@@ -378,17 +399,17 @@ function buildOptimizationCandidates(rows: TrafficRow[], groupMode: GroupMode): 
   return candidates
 }
 
-function optimizeThresholds(rows: TrafficRow[], groupMode: GroupMode): OptimizationResult | null {
+function optimizeThresholds(rows: TrafficRow[]): OptimizationResult | null {
   if (!rows.length) {
     return null
   }
 
   let best: OptimizationResult | null = null
   let bestFeasible: OptimizationResult | null = null
-  const candidates = buildOptimizationCandidates(rows, groupMode)
+  const candidates = buildOptimizationCandidates(rows)
 
   for (const thresholds of candidates) {
-    const groups = buildAnalysis(rows, groupMode, thresholds)
+    const groups = buildAnalysis(rows, thresholds)
     const summary = summarizeGroups(groups)
     const beforeFillRate = metricFillRate(summary.before)
     const afterFillRate = metricFillRate(summary.after)
@@ -442,35 +463,38 @@ function optimizeThresholds(rows: TrafficRow[], groupMode: GroupMode): Optimizat
 }
 
 function App() {
-  const [workbook, setWorkbook] = useState<XLSX.WorkBook | null>(null)
-  const [selectedSheet, setSelectedSheet] = useState<string>('')
-  const [groupMode, setGroupMode] = useState<GroupMode>('supply')
+  const [reportType, setReportType] = useState<ReportType>('bundle')
+  const [workbooks, setWorkbooks] = useState<Record<ReportType, XLSX.WorkBook | null>>({ bundle: null, country: null })
+  const [sheets, setSheets] = useState<Record<ReportType, string>>({ bundle: '', country: '' })
+  const [uploadErrors, setUploadErrors] = useState<Record<ReportType, string>>({ bundle: '', country: '' })
+  const [endpoints, setEndpoints] = useState<Record<ReportType, string>>({ bundle: 'ALL', country: 'ALL' })
   const [thresholds, setThresholds] = useState<Thresholds>(DEFAULT_THRESHOLDS)
-  const [uploadError, setUploadError] = useState<string>('')
-  const [selectedGroup, setSelectedGroup] = useState<string>('ALL')
   const [recommendedOptimization, setRecommendedOptimization] = useState<OptimizationResult | null>(null)
+
+  const config = REPORT_CONFIG[reportType]
+  const workbook = workbooks[reportType]
+  const selectedSheet = sheets[reportType]
+  const uploadError = uploadErrors[reportType]
+  const selectedEndpoint = endpoints[reportType]
 
   const parsedSheet = useMemo(() => {
     if (!workbook || !selectedSheet) {
       return { rows: [] as TrafficRow[], error: '' }
     }
     const sheet = workbook.Sheets[selectedSheet]
-    const { rows, error } = extractRowsFromSheet(sheet)
+    const { rows, error } = extractRowsFromSheet(sheet, reportType)
     return { rows, error: error ?? '' }
-  }, [workbook, selectedSheet])
+  }, [workbook, selectedSheet, reportType])
 
   const trafficRows = parsedSheet.rows
   const error = uploadError || parsedSheet.error
 
-  const groups = useMemo(
-    () => buildAnalysis(trafficRows, groupMode, thresholds),
-    [groupMode, thresholds, trafficRows],
-  )
+  const groups = useMemo(() => buildAnalysis(trafficRows, thresholds), [thresholds, trafficRows])
 
-  const groupOptions = useMemo(() => ['ALL', ...groups.map((group) => group.groupKey)], [groups])
+  const endpointOptions = useMemo(() => ['ALL', ...groups.map((group) => group.groupKey)], [groups])
   const filteredGroups = useMemo(
-    () => (selectedGroup === 'ALL' ? groups : groups.filter((group) => group.groupKey === selectedGroup)),
-    [groups, selectedGroup],
+    () => (selectedEndpoint === 'ALL' ? groups : groups.filter((group) => group.groupKey === selectedEndpoint)),
+    [groups, selectedEndpoint],
   )
 
   const summary = useMemo(() => summarizeGroups(filteredGroups), [filteredGroups])
@@ -485,23 +509,27 @@ function App() {
   const badRows = useMemo(() => allBadRows.slice(0, 250), [allBadRows])
 
   useEffect(() => {
-    if (!groupOptions.includes(selectedGroup)) {
-      setSelectedGroup('ALL')
+    if (!endpointOptions.includes(selectedEndpoint)) {
+      setEndpoints((prev) => ({ ...prev, [reportType]: 'ALL' }))
     }
-  }, [groupOptions, selectedGroup])
+  }, [endpointOptions, selectedEndpoint, reportType])
 
   useEffect(() => {
     setRecommendedOptimization(null)
-  }, [groupMode, selectedGroup, trafficRows])
+  }, [reportType, selectedEndpoint, trafficRows])
+
+  function setEndpoint(value: string) {
+    setEndpoints((prev) => ({ ...prev, [reportType]: value }))
+  }
 
   function calculateRecommendedThresholds() {
-    if (selectedGroup === 'ALL') {
+    if (selectedEndpoint === 'ALL') {
       setRecommendedOptimization(null)
       return
     }
 
-    const selectedRows = trafficRows.filter((row) => (groupMode === 'supply' ? row.supplyName : row.bundle) === selectedGroup)
-    setRecommendedOptimization(optimizeThresholds(selectedRows, groupMode))
+    const selectedRows = trafficRows.filter((row) => row.supplyName === selectedEndpoint)
+    setRecommendedOptimization(optimizeThresholds(selectedRows))
   }
 
   function applyRecommendedThresholds() {
@@ -516,6 +544,7 @@ function App() {
     if (!file) {
       return
     }
+    const targetReport = reportType
     file
       .arrayBuffer()
       .then((buffer) => {
@@ -525,13 +554,13 @@ function App() {
           const data = XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false }) as unknown[][]
           return data.length > 1
         })
-        setWorkbook(wb)
-        setSelectedSheet(firstDataSheet ?? wb.SheetNames[0] ?? '')
-        setSelectedGroup('ALL')
-        setUploadError('')
+        setWorkbooks((prev) => ({ ...prev, [targetReport]: wb }))
+        setSheets((prev) => ({ ...prev, [targetReport]: firstDataSheet ?? wb.SheetNames[0] ?? '' }))
+        setEndpoints((prev) => ({ ...prev, [targetReport]: 'ALL' }))
+        setUploadErrors((prev) => ({ ...prev, [targetReport]: '' }))
       })
       .catch(() => {
-        setUploadError('Could not parse file. Please upload a valid .xlsx report.')
+        setUploadErrors((prev) => ({ ...prev, [targetReport]: 'Could not parse file. Please upload a valid .xlsx report.' }))
       })
   }
 
@@ -541,14 +570,12 @@ function App() {
     }
 
     const exportedRows = allBadRows.map((row) => ({
-      [groupMode === 'supply' ? 'Supply' : 'Bundle']: row.groupKey,
       'Supply Name': row.supplyName,
-      Bundle: row.bundle,
-      Country: row.country,
-      'Demand Requests': row.requests,
-      Impressions: row.impressions,
+      [config.dimensionLabel]: row.dimension,
+      'Supply Requests': row.requests,
+      'Supply Impressions': row.impressions,
       Cost: row.cost,
-      sRPM: row.srpm,
+      'sRPM $': row.srpm,
       'Request Share': row.requestShare,
       'Cost Share': row.costShare,
       'Fill Rate': row.fillRate,
@@ -558,8 +585,8 @@ function App() {
     const blockMap = new Map<
       string,
       {
-        bundle: string
-        country: string
+        supplyName: string
+        dimension: string
         requests: number
         impressions: number
         cost: number
@@ -567,10 +594,10 @@ function App() {
     >()
 
     for (const row of allBadRows) {
-      const key = `${row.bundle}:::${row.country}`
+      const key = `${row.supplyName}:::${row.dimension}`
       const existing = blockMap.get(key) ?? {
-        bundle: row.bundle,
-        country: row.country,
+        supplyName: row.supplyName,
+        dimension: row.dimension,
         requests: 0,
         impressions: 0,
         cost: 0,
@@ -581,16 +608,16 @@ function App() {
       blockMap.set(key, existing)
     }
 
-    const countriesToBlock = Array.from(blockMap.values())
+    const toBlock = Array.from(blockMap.values())
       .map((row) => {
         const fillRate = row.requests > 0 ? row.impressions / row.requests : 0
         const srpm = row.requests > 0 ? (row.cost / row.requests) * 1000 : 0
-        return { bundle: row.bundle, country: row.country, requests: row.requests, fillRate, srpm }
+        return { supplyName: row.supplyName, dimension: row.dimension, requests: row.requests, fillRate, srpm }
       })
       .sort((a, b) => {
-        const bundleDiff = a.bundle.localeCompare(b.bundle)
-        if (bundleDiff !== 0) {
-          return bundleDiff
+        const supplyDiff = a.supplyName.localeCompare(b.supplyName)
+        if (supplyDiff !== 0) {
+          return supplyDiff
         }
         const fillDiff = a.fillRate - b.fillRate
         if (fillDiff !== 0) {
@@ -604,20 +631,20 @@ function App() {
       })
       .map((row) => {
         return {
-          Bundle: row.bundle,
-          Country: row.country,
+          'Supply Name': row.supplyName,
+          [config.dimensionLabel]: row.dimension,
         }
       })
 
     const worksheet = XLSX.utils.json_to_sheet(exportedRows)
-    const blockWorksheet = XLSX.utils.json_to_sheet(countriesToBlock)
+    const blockWorksheet = XLSX.utils.json_to_sheet(toBlock)
     const workbook = XLSX.utils.book_new()
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Flagged Rows')
-    XLSX.utils.book_append_sheet(workbook, blockWorksheet, 'Countries to Block')
+    XLSX.utils.book_append_sheet(workbook, blockWorksheet, `${config.dimensionLabel} to Block`.slice(0, 31))
 
-    const selectedSegment = selectedGroup === 'ALL' ? 'all' : selectedGroup
+    const selectedSegment = selectedEndpoint === 'ALL' ? 'all' : selectedEndpoint
     const safeSegment = selectedSegment.toLowerCase().replaceAll(/[^a-z0-9]+/g, '-').replaceAll(/^-|-$/g, '')
-    XLSX.writeFile(workbook, `flagged-bad-traffic-${safeSegment || 'rows'}.xlsx`)
+    XLSX.writeFile(workbook, `flagged-${reportType}-${safeSegment || 'rows'}.xlsx`)
   }
 
   return (
@@ -630,9 +657,29 @@ function App() {
           <div>
             <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">Supply Traffic Optimizer</h1>
             <p className="text-sm text-muted-foreground md:text-base">
-              Upload your analytics Excel and spot bad traffic by Supply Name or Bundle (Platform).
+              Choose a report type, upload it, pick an endpoint, and spot bad traffic.
             </p>
           </div>
+        </div>
+
+        <div className="mt-5 grid grid-cols-2 gap-2 rounded-xl border border-border bg-card p-1 sm:max-w-md">
+          {(Object.keys(REPORT_CONFIG) as ReportType[]).map((type) => {
+            const TypeIcon = REPORT_CONFIG[type].icon
+            const active = reportType === type
+            return (
+              <button
+                key={type}
+                type="button"
+                onClick={() => setReportType(type)}
+                className={`flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-semibold transition-colors ${
+                  active ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-secondary'
+                }`}
+              >
+                <TypeIcon className="h-4 w-4" />
+                {REPORT_CONFIG[type].label}
+              </button>
+            )
+          })}
         </div>
       </header>
 
@@ -642,9 +689,11 @@ function App() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <UploadCloud className="h-4 w-4 text-primary" />
-                Upload report
+                Upload {config.label} report
               </CardTitle>
-              <CardDescription>Supported: .xlsx export files.</CardDescription>
+              <CardDescription>
+                Expected columns: Supply Name, {config.dimensionLabel}, Supply Requests, Supply Impressions, Cost, sRPM $.
+              </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <Input type="file" accept=".xlsx,.xls" onChange={handleUpload} />
@@ -656,12 +705,31 @@ function App() {
                   <select
                     id="sheet"
                     value={selectedSheet}
-                    onChange={(event) => setSelectedSheet(event.target.value)}
+                    onChange={(event) => setSheets((prev) => ({ ...prev, [reportType]: event.target.value }))}
                     className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
                   >
                     {workbook.SheetNames.map((sheetName) => (
                       <option key={sheetName} value={sheetName}>
                         {sheetName}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {workbook && endpointOptions.length > 1 && (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium" htmlFor="endpoint">
+                    Endpoint (Supply Name)
+                  </label>
+                  <select
+                    id="endpoint"
+                    value={selectedEndpoint}
+                    onChange={(event) => setEndpoint(event.target.value)}
+                    className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+                  >
+                    {endpointOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option === 'ALL' ? 'All endpoints' : option}
                       </option>
                     ))}
                   </select>
@@ -685,17 +753,6 @@ function App() {
               <CardDescription>Adjust thresholds to control bad-traffic detection.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="grid gap-2">
-                <label className="text-sm font-medium">Group by</label>
-                <div className="grid grid-cols-2 gap-2">
-                  <Button variant={groupMode === 'supply' ? 'default' : 'outline'} onClick={() => setGroupMode('supply')}>
-                    Supply Name
-                  </Button>
-                  <Button variant={groupMode === 'bundle' ? 'default' : 'outline'} onClick={() => setGroupMode('bundle')}>
-                    Bundle
-                  </Button>
-                </div>
-              </div>
               <div className="rounded-lg border border-primary/25 bg-primary/5 p-3">
                 <div className="flex items-start gap-2">
                   <div className="rounded-md bg-primary/15 p-1.5 text-primary">
@@ -704,7 +761,7 @@ function App() {
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-semibold">Auto optimize thresholds</p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      Select one {groupMode === 'supply' ? 'supply' : 'bundle'} first, then calculate recommendations for that traffic only.
+                      Select one endpoint first, then calculate recommendations for that traffic only.
                     </p>
                   </div>
                 </div>
@@ -712,14 +769,14 @@ function App() {
                   className="mt-3 w-full"
                   type="button"
                   onClick={calculateRecommendedThresholds}
-                  disabled={selectedGroup === 'ALL' || trafficRows.length === 0}
+                  disabled={selectedEndpoint === 'ALL' || trafficRows.length === 0}
                 >
                   <Sparkles className="h-4 w-4" />
                   Calculate recommended params
                 </Button>
-                {selectedGroup === 'ALL' && trafficRows.length > 0 && (
+                {selectedEndpoint === 'ALL' && trafficRows.length > 0 && (
                   <p className="mt-2 text-xs text-muted-foreground">
-                    Choose a specific {groupMode === 'supply' ? 'supply' : 'bundle'} from the performance filter to enable auto optimization.
+                    Choose a specific endpoint above to enable auto optimization.
                   </p>
                 )}
                 {recommendedOptimization && (
@@ -773,36 +830,23 @@ function App() {
           <Card>
             <CardHeader>
               <CardTitle>Performance before vs after optimization</CardTitle>
-              <CardDescription>After = same supply rows excluding rows flagged as bad traffic.</CardDescription>
+              <CardDescription>After = same endpoint rows excluding rows flagged as bad traffic.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              {groupOptions.length > 1 && (
-                <select
-                  value={selectedGroup}
-                  onChange={(event) => setSelectedGroup(event.target.value)}
-                  className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-primary/30 md:w-[360px]"
-                >
-                  {groupOptions.map((group) => (
-                    <option key={group} value={group}>
-                      {group}
-                    </option>
-                  ))}
-                </select>
-              )}
               <PerformanceComparison summary={summary} />
             </CardContent>
           </Card>
 
           <Card>
             <CardHeader>
-              <CardTitle>Per-group optimization impact</CardTitle>
-              <CardDescription>Sorted by demand requests.</CardDescription>
+              <CardTitle>Per-endpoint optimization impact</CardTitle>
+              <CardDescription>Sorted by supply requests.</CardDescription>
             </CardHeader>
             <CardContent className="overflow-x-auto">
               <table className="w-full min-w-[920px] text-left text-sm">
                 <thead>
                   <tr className="border-b border-border text-muted-foreground">
-                    <th className="py-2 pr-3 font-medium">{groupMode === 'supply' ? 'Supply' : 'Bundle'}</th>
+                    <th className="py-2 pr-3 font-medium">Endpoint (Supply Name)</th>
                     <th className="py-2 pr-3 font-medium">Bad Rows</th>
                     <th className="py-2 pr-3 font-medium">Before Requests</th>
                     <th className="py-2 pr-3 font-medium">After Requests</th>
@@ -837,7 +881,7 @@ function App() {
               <div>
                 <CardTitle>Flagged bad traffic rows ({allBadRows.length})</CardTitle>
                 <CardDescription>
-                  Showing top {badRows.length} by demand requests. Export includes all flagged rows and a supplier block list.
+                  Showing top {badRows.length} by supply requests. Export includes all flagged rows and a {config.dimensionLabel.toLowerCase()} block list.
                 </CardDescription>
               </div>
               <Button type="button" variant="outline" size="sm" onClick={exportFlaggedRows} disabled={allBadRows.length === 0}>
@@ -846,12 +890,11 @@ function App() {
               </Button>
             </CardHeader>
             <CardContent className="overflow-x-auto">
-              <table className="w-full min-w-[1100px] text-left text-sm">
+              <table className="w-full min-w-[1000px] text-left text-sm">
                 <thead>
                   <tr className="border-b border-border text-muted-foreground">
-                    <th className="py-2 pr-3 font-medium">{groupMode === 'supply' ? 'Supply' : 'Bundle'}</th>
-                    <th className="py-2 pr-3 font-medium">Bundle</th>
-                    <th className="py-2 pr-3 font-medium">Country</th>
+                    <th className="py-2 pr-3 font-medium">Supply Name</th>
+                    <th className="py-2 pr-3 font-medium">{config.dimensionLabel}</th>
                     <th className="py-2 pr-3 font-medium">Requests</th>
                     <th className="py-2 pr-3 font-medium">Impressions</th>
                     <th className="py-2 pr-3 font-medium">Cost</th>
@@ -863,9 +906,8 @@ function App() {
                 <tbody>
                   {badRows.map((row) => (
                     <tr key={`${row.groupKey}-${row.rowId}`} className="border-b border-border/70">
-                      <td className="py-2 pr-3">{row.groupKey}</td>
-                      <td className="py-2 pr-3">{row.bundle}</td>
-                      <td className="py-2 pr-3">{row.country}</td>
+                      <td className="py-2 pr-3">{row.supplyName}</td>
+                      <td className="py-2 pr-3">{row.dimension}</td>
                       <td className="py-2 pr-3">{formatNumber(row.requests)}</td>
                       <td className="py-2 pr-3">{formatNumber(row.impressions)}</td>
                       <td className="py-2 pr-3">{formatCost(row.cost)}</td>
@@ -930,14 +972,14 @@ function PerformanceComparison({ summary }: { summary: SummaryMetrics }) {
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <ComparisonMetric
-        label="Demand Requests"
+        label="Supply Requests"
         icon={MousePointerClick}
         before={formatNumber(summary.before.requests)}
         after={formatNumber(summary.after.requests)}
         delta={metricChange(summary.after.requests, summary.before.requests)}
       />
       <ComparisonMetric
-        label="Impressions"
+        label="Supply Impressions"
         icon={Eye}
         before={formatNumber(summary.before.impressions)}
         after={formatNumber(summary.after.impressions)}
@@ -997,17 +1039,17 @@ function ComparisonMetric({
           {formatSignedPercent(delta)}
         </div>
       </div>
-      <div className="grid items-stretch gap-3 sm:grid-cols-[1fr_auto_1fr]">
-        <div className="rounded-lg border border-border bg-card p-3">
+      <div className="grid items-stretch gap-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+        <div className="min-w-0 rounded-lg border border-border bg-card p-3">
           <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Before</p>
-          <p className="mt-2 break-words text-xl font-bold tracking-tight">{before}</p>
+          <p className="mt-2 break-words text-base font-bold tracking-tight">{before}</p>
         </div>
         <div className="flex items-center justify-center text-muted-foreground">
           <ArrowRight className="h-5 w-5" />
         </div>
-        <div className="rounded-lg border border-primary/25 bg-primary/5 p-3">
+        <div className="min-w-0 rounded-lg border border-primary/25 bg-primary/5 p-3">
           <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">After</p>
-          <p className="mt-2 break-words text-xl font-bold tracking-tight">{after}</p>
+          <p className="mt-2 break-words text-base font-bold tracking-tight">{after}</p>
         </div>
       </div>
     </div>
